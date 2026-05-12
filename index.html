@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="vi" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>KIEN NE Pro — Đọc truyện online</title>
+<meta name="theme-color" content="#0f0e0c">
+
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('kn-theme');
+      if (t !== 'light' && t !== 'sepia') t = 'dark';
+      document.documentElement.setAttribute('data-theme', t);
+    } catch (e) { document.documentElement.setAttribute('data-theme', 'dark'); }
+  })();
+</script>
+
+<style>
+  html, body { margin: 0; background: #0f0e0c; color: #e8e0d0; }
+  html[data-theme="light"], html[data-theme="light"] body { background: #ffffff; color: #1a1815; }
+  html[data-theme="sepia"], html[data-theme="sepia"] body { background: #fdf6e3; color: #3a2d1f; }
+  body { opacity: 0; transition: opacity .25s; }
+  body.ready { opacity: 1; }
+</style>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@300;400;500;600;700&family=Crimson+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script type="module" crossorigin src="/truyenonline/assets/index-B9Tg5WIE.js"></script>
+  <link rel="stylesheet" crossorigin href="/truyenonline/assets/index--2AKeJp2.css">
+</head>
+<body>
+<div id="app"></div>
+</body>
+</html>
