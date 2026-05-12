@@ -947,6 +947,22 @@
     object-fit: cover;
     background: var(--bg-elev-2);
   }
+
+  /* Offline-cache badge in reader breadcrumb */
+  .offline-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    padding: 2px 8px;
+    margin-left: 8px;
+    background: rgba(106, 156, 94, 0.18);
+    color: #6a9c5e;
+    border: 1px solid rgba(106, 156, 94, 0.35);
+    border-radius: 999px;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+  }
   .recent-title {
     font-size: 13px;
     font-weight: 600;
@@ -992,8 +1008,15 @@
 const BASE = 'https://truyenfull.vision';
 // Nếu app được serve từ http/https origin (chạy qua server.js), dùng /proxy?url= local.
 // Nếu mở bằng file:// thì rơi xuống các public proxy.
-const LOCAL_PROXY = 'https://sparkling-flower-9afd.kien2206.workers.dev/?url=';
-const PUBLIC_PROXIES = [];
+const LOCAL_PROXY = (location.protocol === 'http:' || location.protocol === 'https:')
+  ? location.origin + '/proxy?url='
+  : null;
+const PUBLIC_PROXIES = [
+  { name: 'allorigins', build: url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url) },
+  { name: 'corsproxy.io', build: url => 'https://corsproxy.io/?' + encodeURIComponent(url) },
+  { name: 'codetabs', build: url => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url) },
+  { name: 'thingproxy', build: url => 'https://thingproxy.freeboard.io/fetch/' + url },
+];
 const PAGE_SIZE = 60; // chapters per page in list
 
 // ========== STATE ==========
@@ -1381,18 +1404,27 @@ async function openChapter(url, storyContext) {
   render();
   window.scrollTo(0, 0);
   try {
-    // Cache check (fetch/parse logic untouched — just skip when fresh copy available)
+    // Cache hierarchy: L1 localStorage (sync) → L2 IndexedDB (persistent offline) → network.
+    // Fetch/parse logic untouched — they only run on cache miss.
     let ch = loadChapterCache(url);
+    let cameFromCache = !!ch;
+    if (!ch) {
+      ch = await idbGetChapter(url);
+      cameFromCache = !!ch;
+      if (ch) saveChapterCache(url, ch); // warm L1
+    }
     if (!ch) {
       const doc = await fetchPage(url);
       ch = parseChapter(doc, url);
-      saveChapterCache(url, ch);
+      saveChapterCache(url, ch);   // L1
+      idbPutChapter(url, ch);      // L2 — fire-and-forget, no await blocking UI
     }
     if (storyContext) {
       ch.storyTitle = ch.storyTitle || storyContext.title;
       ch.slug = storyContext.slug || ch.slug;
       ch.storyUrl = ch.storyUrl || storyContext.url;
     }
+    ch._fromCache = cameFromCache;
     state.chapter = ch;
     setReadingState(ch.slug, { chapterUrl: url, chapterTitle: ch.title });
     saveReadingProgress(ch.slug, {
@@ -1669,6 +1701,7 @@ function renderReader() {
       <div class="reader-wrap">
         <div class="reader-breadcrumb">
           ${c.storyTitle ? `<a onclick="backToStory()" style="cursor:pointer">${escapeHtml(c.storyTitle)}</a>` : ''}
+          ${c._fromCache ? `<span class="offline-badge" title="Chương đã lưu offline — đọc được khi mất mạng">⚡ Offline</span>` : ''}
         </div>
         <h1 class="reader-title">${escapeHtml(c.title)}</h1>
         <div class="reader-content">${c.html || '<i>Không có nội dung.</i>'}</div>
@@ -1815,9 +1848,15 @@ const CHAPTER_KEYS_KEY = 'kn_chapter_keys';
 const CHAPTER_CACHE_MAX = 20;
 
 function _chapterCacheKey(url) {
-  // btoa needs latin-1 — encode unicode first
-  try { return CHAPTER_CACHE_KEY + btoa(unescape(encodeURIComponent(url))).slice(0, 24); }
-  catch { return CHAPTER_CACHE_KEY + url.length + '_' + url.slice(-16); }
+  // FNV-1a 32-bit hash → ~7 char base36. Collision-resistant for our 20-entry cache.
+  // (Previous btoa(url).slice(0,24) collided for chapters in same story because
+  //  the base64 prefix was identical — caused wrong chapter served from cache.)
+  let h = 2166136261;
+  for (let i = 0; i < url.length; i++) {
+    h ^= url.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return CHAPTER_CACHE_KEY + (h >>> 0).toString(36);
 }
 function _readKeys() {
   try { return JSON.parse(localStorage.getItem(CHAPTER_KEYS_KEY) || '[]'); }
@@ -1833,7 +1872,10 @@ function loadChapterCache(url) {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const obj = JSON.parse(raw);
-    return obj && obj.data ? obj.data : null;
+    if (!obj || !obj.data) return null;
+    // URL verification — guard against rare hash collisions
+    if (obj.url && obj.url !== url) return null;
+    return obj.data;
   } catch { return null; }
 }
 
@@ -1887,6 +1929,104 @@ function checkStorage() {
     }
     if (total > 4 * 1024 * 1024) clearOldChapterCache(5);
   } catch {}
+}
+
+// ========== IndexedDB chapter store (L2 — persistent, full offline) ==========
+// L1 (localStorage LRU above) is sync hot cache (~20 chapters).
+// L2 (IndexedDB here) is unlimited persistent store — once a chapter is fetched
+// it's readable forever without network.
+const IDB_NAME = 'kn-store';
+const IDB_VERSION = 1;
+const IDB_CHAPTER_STORE = 'chapters';
+let _dbPromise = null;
+
+function _openIDB() {
+  if (_dbPromise) return _dbPromise;
+  _dbPromise = new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') return reject(new Error('No IndexedDB'));
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(IDB_CHAPTER_STORE)) {
+        const store = db.createObjectStore(IDB_CHAPTER_STORE, { keyPath: 'url' });
+        store.createIndex('slug', 'slug', { unique: false });
+        store.createIndex('ts', 'ts', { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }).catch((e) => { _dbPromise = null; throw e; });
+  return _dbPromise;
+}
+
+async function idbGetChapter(url) {
+  try {
+    const db = await _openIDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction(IDB_CHAPTER_STORE, 'readonly');
+      const req = tx.objectStore(IDB_CHAPTER_STORE).get(url);
+      req.onsuccess = () => resolve(req.result && req.result.data ? req.result.data : null);
+      req.onerror = () => resolve(null);
+    });
+  } catch { return null; }
+}
+
+async function idbPutChapter(url, data) {
+  try {
+    const db = await _openIDB();
+    const payload = {
+      url,
+      slug: data.slug || '',
+      ts: Date.now(),
+      data: {
+        title: data.title, html: data.html,
+        prevUrl: data.prevUrl, nextUrl: data.nextUrl,
+        url: data.url, storyUrl: data.storyUrl,
+        storyTitle: data.storyTitle, slug: data.slug,
+      },
+    };
+    return await new Promise((resolve) => {
+      const tx = db.transaction(IDB_CHAPTER_STORE, 'readwrite');
+      tx.objectStore(IDB_CHAPTER_STORE).put(payload);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    });
+  } catch { return false; }
+}
+
+async function idbHasChapter(url) {
+  try {
+    const db = await _openIDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction(IDB_CHAPTER_STORE, 'readonly');
+      const req = tx.objectStore(IDB_CHAPTER_STORE).count(url);
+      req.onsuccess = () => resolve(req.result > 0);
+      req.onerror = () => resolve(false);
+    });
+  } catch { return false; }
+}
+
+async function idbCountBySlug(slug) {
+  try {
+    const db = await _openIDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction(IDB_CHAPTER_STORE, 'readonly');
+      const req = tx.objectStore(IDB_CHAPTER_STORE).index('slug').count(slug);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(0);
+    });
+  } catch { return 0; }
+}
+
+async function idbStorageEstimate() {
+  try {
+    if (navigator.storage && navigator.storage.estimate) {
+      const e = await navigator.storage.estimate();
+      return { usage: e.usage || 0, quota: e.quota || 0 };
+    }
+  } catch {}
+  return null;
 }
 
 // ========== READING PROGRESS + HISTORY ==========
